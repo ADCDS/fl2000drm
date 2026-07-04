@@ -2,9 +2,17 @@
 
 A modern, from-scratch Linux kernel driver for the **Fresco Logic FL2000DX**
 USB 3.0 → HDMI/VGA display adapter (USB ID `1d5c:2000`), the chip inside
-most of the cheap "USB to HDMI" dongles. The dongle shows up as a normal
-KMS/DRM display (`card*`/`HDMI-A-*`): Wayland compositors and X extend the
-desktop onto it like any other monitor.
+most of the cheap "USB to HDMI" dongles — sold retail under names like
+**Multilaser WI347** ("Cabo Audiovisual USB para HDMI"). The dongle shows
+up as a normal KMS/DRM display (`card*`/`HDMI-A-*`): Wayland compositors
+and X extend the desktop onto it like any other monitor.
+
+| | |
+|:---:|:---:|
+| ![FL2000 dongle](images/dongle.jpg) | ![Multilaser WI347 label](images/dongle-label.jpg) |
+| *The dongle: FL2000DX + ITE IT66121 inside* | *Sold as the Multilaser WI347* |
+| ![HDMI to VGA chain](images/hdmi-vga-chain.jpg) | ![Video playback](images/video-playback.jpg) |
+| *Tested through an HDMI→VGA converter into a 1366x768 panel* | *YouTube playing on the FL2000 display at 1360x768@60, driven by this driver* |
 
 Fresco Logic's official driver targets kernel 3.10 and no longer builds;
 this driver was written from scratch for kernel **6.12+**, modeled on the
@@ -89,6 +97,16 @@ The Fresco Logic GPL reference driver (protocol source of truth) lives at
 ## Credits & license
 
 GPL-2.0. Protocol knowledge derives from Fresco Logic's official GPL
-reference driver. Driver, userspace harness, and protocol notes developed
-by Adriel Santos together with Claude (Anthropic) in one very long,
-very fun reverse-engineering session.
+reference driver.
+
+This driver was **entirely vibecoded by Claude Fable 5** (Anthropic) in a
+single session — every line of the kernel module, the userspace
+reverse-engineering harness, the protocol documentation, and this README.
+Adriel Santos supplied the hardware, the eyeballs on the monitor, the
+unplug–replug fingers, and the photos. The full journey went from "there
+is no Linux driver for this dongle" to the working desktop pictured above:
+userspace register probing over EP0, EDID through the IT66121's quirky DDC
+engine, first light from Python, then the DRM driver — debugging compositor
+freezes, USB device resets caused by a fake driver CD, IOMMU corruption,
+a format latch that only accepts one bit at a time, and a 64-bit word swap
+documented nowhere on the internet.
