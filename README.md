@@ -14,6 +14,13 @@ and X extend the desktop onto it like any other monitor.
 | ![HDMI to VGA chain](images/hdmi-vga-chain.jpg) | ![Video playback](images/video-playback.jpg) |
 | *Tested through an HDMI→VGA converter into a 1366x768 panel* | *YouTube playing on the FL2000 display at 1360x768@60, driven by this driver* |
 
+## Demo video
+
+[![Watch the demo on YouTube](https://img.youtube.com/vi/YtxEV64ROw0/maxresdefault.jpg)](https://youtu.be/YtxEV64ROw0)
+
+*Click to watch: the FL2000 driving a real desktop, then a close-up of the
+dongle itself. → [youtu.be/YtxEV64ROw0](https://youtu.be/YtxEV64ROw0)*
+
 Fresco Logic's official driver targets kernel 3.10 and no longer builds;
 this driver was written from scratch for kernel **6.12+**, modeled on the
 mainline `gm12u320`/`udl` drivers (simple display pipe, GEM shmem, shadow
