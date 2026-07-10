@@ -213,26 +213,76 @@ static void fl2000_stream_work(struct work_struct *work)
 }
 
 /*
- * EDID cache
+ * EDID cache + async connector status.
+ *
+ * Everything userspace can reach (detect/get_modes ioctls) is served from
+ * cached state; the actual HPD and DDC traffic runs in status_work. A DDC
+ * read is seconds in the best case and minutes when the ITE bus-hang
+ * recovery kicks in — running it inside a connector ioctl blocks the X
+ * server (single-threaded) and freezes the entire desktop.
  */
 
 static void fl2000_refresh_edid_cache(struct fl2000 *fl)
 {
+	u8 buf[sizeof(fl->edid_cache)];
 	int blocks, i;
 
+	mutex_lock(&fl->edid_lock);
 	fl->edid_valid = false;
+	mutex_unlock(&fl->edid_lock);
 
-	if (fl2000_ite_read_edid_block(fl, fl->edid_cache, 0, 128))
+	if (fl2000_ite_read_edid_block(fl, buf, 0, 128))
 		return;
 
-	blocks = min_t(int, fl->edid_cache[126], 3) + 1;
+	blocks = min_t(int, buf[126], 3) + 1;
 	for (i = 1; i < blocks; i++) {
-		if (fl2000_ite_read_edid_block(fl, fl->edid_cache + i * 128,
-					       i, 128))
+		if (fl2000_ite_read_edid_block(fl, buf + i * 128, i, 128))
 			return;
 	}
+
+	mutex_lock(&fl->edid_lock);
+	memcpy(fl->edid_cache, buf, blocks * 128);
 	fl->edid_len = blocks * 128;
 	fl->edid_valid = true;
+	mutex_unlock(&fl->edid_lock);
+}
+
+#define FL2000_EDID_MAX_ATTEMPTS 3
+
+static void fl2000_status_work(struct work_struct *work)
+{
+	struct fl2000 *fl = container_of(work, struct fl2000, status_work);
+	bool changed = false;
+	int hpd, idx;
+
+	if (!drm_dev_enter(&fl->drm, &idx))
+		return;
+
+	hpd = fl2000_ite_hpd(fl);
+	if (hpd < 0)
+		goto out;
+
+	if (atomic_xchg(&fl->hpd_status, hpd) != hpd) {
+		changed = true;
+		fl->edid_attempts = 0;
+		if (!hpd) {
+			mutex_lock(&fl->edid_lock);
+			fl->edid_valid = false;
+			mutex_unlock(&fl->edid_lock);
+		}
+	}
+
+	if (hpd && !fl->edid_valid &&
+	    fl->edid_attempts < FL2000_EDID_MAX_ATTEMPTS) {
+		fl->edid_attempts++;
+		fl2000_refresh_edid_cache(fl);
+		if (fl->edid_valid)
+			changed = true;
+	}
+	if (changed)
+		drm_kms_helper_hotplug_event(&fl->drm);
+out:
+	drm_dev_exit(idx);
 }
 
 /*
@@ -469,11 +519,11 @@ static int fl2000_connector_get_modes(struct drm_connector *connector)
 	int count;
 
 	if (fl->ite_present) {
-		if (!fl->edid_valid)
-			fl2000_refresh_edid_cache(fl);
+		mutex_lock(&fl->edid_lock);
 		if (fl->edid_valid)
 			drm_edid = drm_edid_alloc(fl->edid_cache,
 						  fl->edid_len);
+		mutex_unlock(&fl->edid_lock);
 	}
 
 	drm_edid_connector_update(connector, drm_edid);
@@ -544,19 +594,23 @@ static enum drm_connector_status
 fl2000_connector_detect(struct drm_connector *connector, bool force)
 {
 	struct fl2000 *fl = to_fl2000(connector->dev);
-	int hpd;
+	int idx;
 
 	if (!fl->ite_present)
 		return connector_status_connected;
 
-	hpd = fl2000_ite_hpd(fl);
-	if (hpd < 0)
-		return connector_status_unknown;
-	if (!hpd) {
-		fl->edid_valid = false;
-		return connector_status_disconnected;
+	/*
+	 * Cached state only — no USB traffic here. The worker re-reads HPD
+	 * and fires a hotplug event on change, so a stale answer lasts at
+	 * most one poll period.
+	 */
+	if (drm_dev_enter(&fl->drm, &idx)) {
+		queue_work(system_unbound_wq, &fl->status_work);
+		drm_dev_exit(idx);
 	}
-	return connector_status_connected;
+
+	return atomic_read(&fl->hpd_status) ? connector_status_connected :
+					      connector_status_disconnected;
 }
 
 static const struct drm_connector_helper_funcs fl2000_connector_helper_funcs = {
@@ -586,7 +640,7 @@ static const struct drm_driver fl2000_drm_driver = {
 	.desc = "Fresco Logic FL2000 USB display",
 	.date = "20260710",
 	.major = 1,
-	.minor = 2,
+	.minor = 3,
 };
 
 static const struct drm_mode_config_funcs fl2000_mode_config_funcs = {
@@ -617,8 +671,10 @@ static int fl2000_probe(struct usb_interface *intf,
 	fl->usb3 = udev->speed >= USB_SPEED_SUPER;
 	mutex_init(&fl->hw_lock);
 	mutex_init(&fl->ite_lock);
+	mutex_init(&fl->edid_lock);
 	spin_lock_init(&fl->frame_swap_lock);
 	INIT_WORK(&fl->stream_work, fl2000_stream_work);
+	INIT_WORK(&fl->status_work, fl2000_status_work);
 
 	fl->stream_wq = alloc_workqueue("fl2000-stream",
 					WQ_HIGHPRI | WQ_UNBOUND, 1);
@@ -658,6 +714,7 @@ static int fl2000_probe(struct usb_interface *intf,
 		 */
 		for (i = 0; i < 60; i++) {
 			if (fl2000_ite_hpd(fl) == 1) {
+				atomic_set(&fl->hpd_status, 1);
 				fl2000_refresh_edid_cache(fl);
 				break;
 			}
@@ -722,6 +779,7 @@ static void fl2000_disconnect(struct usb_interface *intf)
 
 	drm_kms_helper_poll_fini(drm);
 	drm_dev_unplug(drm);
+	cancel_work_sync(&fl->status_work);
 	WRITE_ONCE(fl->streaming, false);
 	cancel_work_sync(&fl->stream_work);
 	fl2000_kill_xfers(fl);

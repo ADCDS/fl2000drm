@@ -176,9 +176,19 @@ bit-banged sequence.
 - Panels behind HDMI→VGA converters typically want 1360x768, not 1366
   (their EDID says so); the 1366 table entry works with h_sync_1
   rewritten for 1360 active pixels.
-- EDID reads take ~0.5 s even with tight I2C polling — cache them;
-  never run the DDC path inside a connector ioctl (it blocks the
-  compositor's whole render loop).
+- EDID reads take ~0.5 s even with tight I2C polling, and the ITE DDC
+  bus-hang recovery (`ite_abort_ddc`) can poll for up to 20 s per
+  attempt. NOTHING userspace-reachable may touch the DDC/I2C path:
+  a cache-miss EDID read inside the GETCONNECTOR ioctl blocked Xorg
+  (single-threaded) for ~3.5 minutes on monitor hotplug — the whole
+  desktop appears frozen until the cable is pulled. Serve detect() and
+  get_modes() from cached state only; do HPD/EDID in a worker and fire
+  drm_kms_helper_hotplug_event() on change.
+- On X11, Xorg auto-adopts the dongle as a hot-plugged secondary GPU and
+  its removal path is crash-prone: unplugging the dongle can segfault
+  the X server (NULL deref right after "xf86: remove device"), taking
+  the session down. Userspace bug, not driver — Wayland sessions handle
+  unplug fine. Explains "X died" reports on plug/unplug (issue #1).
 
 ## Confirmed end-to-end (2026-07-04)
 

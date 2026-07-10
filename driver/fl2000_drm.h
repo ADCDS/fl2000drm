@@ -77,7 +77,18 @@ struct fl2000 {
 	atomic_t stream_error;
 	struct workqueue_struct *stream_wq;
 
-	/* EDID cache so connector probes never hit the slow DDC path */
+	/*
+	 * Async connector status: userspace connector ioctls only ever read
+	 * this cached state. All HPD/EDID I2C traffic happens in status_work
+	 * — a slow or hung DDC (bus-hang aborts run 20s per block) must
+	 * never run inside a probe ioctl or it blocks Xorg's whole event
+	 * loop and the desktop appears frozen.
+	 */
+	struct work_struct status_work;
+	atomic_t hpd_status;		/* last known: 1 = connected */
+	int edid_attempts;		/* worker-only, reset on hotplug */
+	/* protects edid_cache/edid_len/edid_valid */
+	struct mutex edid_lock;
 	u8 edid_cache[4 * 128];
 	int edid_len;
 	bool edid_valid;
