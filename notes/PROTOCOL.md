@@ -48,9 +48,19 @@ HDMI transmitter chip on HDMI dongles. Transactions move 4 bytes at a time.
 | 17    | SpiEraseEnable |                                          |
 | 23:18 | reserved       |                                          |
 | 27:24 | DataStatus     | per-byte status, 0 = ok, 1 = failed      |
-| 30:28 | reserved       | **bit 28 always reads 0 but must be     |
-|       |                | written back as 1** (hw quirk, see ref)  |
+| 28    | detect enable  | set at dongle init; **always reads 0 but |
+|       |                | must be written back as 1** (hw quirk)   |
+| 29    | reserved       |                                          |
+| 30    | detect enable  | set at dongle init (see below)           |
 | 31    | OpStatus       | 1 = done. Write 0 to start next op.      |
+
+**Dongle init (after app reset): set bits 28 and 30.** The reference
+driver sets both unconditionally during card initialize (monitor-detect /
+EDID-detect machinery; exact field names unconfirmed). On VGA-only
+dongles (no IT66121) the internal VGA DAC never outputs sync without
+them — black screen, and the bulk pipe eventually stalls (-ETIMEDOUT)
+because scanout never starts consuming. Found and validated on hardware
+by @ftoledo (issue #1, stable 1440x900 on a VGA-only dongle).
 
 `0x8024` — read data (4 bytes, LE; byte at `offset+0` = bits 7:0).
 `0x8028` — write data (4 bytes, LE).

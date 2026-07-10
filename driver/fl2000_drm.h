@@ -93,6 +93,7 @@ int fl2000_reg_write(struct fl2000 *fl, u16 offset, u32 val);
 int fl2000_i2c_read32(struct fl2000 *fl, u8 addr, u8 offset, u32 *val);
 int fl2000_i2c_write32(struct fl2000 *fl, u8 addr, u8 offset, u32 val);
 int fl2000_hw_reset(struct fl2000 *fl);
+int fl2000_hw_dongle_init(struct fl2000 *fl);
 int fl2000_hw_set_mode(struct fl2000 *fl, const struct fl2000_mode *mode,
 		       u32 wire_bpp);
 int fl2000_hw_stream_prep(struct fl2000 *fl);

@@ -162,6 +162,24 @@ int fl2000_hw_reset(struct fl2000 *fl)
 }
 
 /*
+ * Post-reset dongle init from the reference driver's card initialize:
+ * enable the monitor/EDID detect machinery in 0x8020 (bits 28 and 30;
+ * bit 28 always reads back 0, see the I2C quirk above). Without these,
+ * VGA-only dongles (no IT66121) never drive their internal DAC and the
+ * monitor sees no sync — found and validated on hardware by @ftoledo
+ * (issue #1). The reference driver sets them unconditionally.
+ */
+int fl2000_hw_dongle_init(struct fl2000 *fl)
+{
+	int ret;
+
+	mutex_lock(&fl->hw_lock);
+	ret = fl2000_reg_update_locked(fl, 0x8020, 0, BIT(30) | BIT(28));
+	mutex_unlock(&fl->hw_lock);
+	return ret;
+}
+
+/*
  * Timing/PLL table, bulk transfer path, from big_table_*_r0. Timings and
  * PLL are shared between the 16/24-bit variants of each mode.
  */

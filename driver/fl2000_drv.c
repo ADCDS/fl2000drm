@@ -584,9 +584,9 @@ static const struct drm_driver fl2000_drm_driver = {
 	DRM_GEM_SHMEM_DRIVER_OPS,
 	.name = DRIVER_NAME,
 	.desc = "Fresco Logic FL2000 USB display",
-	.date = "20260704",
+	.date = "20260710",
 	.major = 1,
-	.minor = 1,
+	.minor = 2,
 };
 
 static const struct drm_mode_config_funcs fl2000_mode_config_funcs = {
@@ -639,6 +639,10 @@ static int fl2000_probe(struct usb_interface *intf,
 	if (ret)
 		return dev_err_probe(&intf->dev, ret,
 				     "device not responding\n");
+	ret = fl2000_hw_dongle_init(fl);
+	if (ret)
+		return dev_err_probe(&intf->dev, ret,
+				     "dongle init failed\n");
 
 	fl->ite_present = fl2000_ite_detect(fl);
 	if (fl->ite_present) {
@@ -671,7 +675,8 @@ static int fl2000_probe(struct usb_interface *intf,
 	drm->mode_config.funcs = &fl2000_mode_config_funcs;
 
 	ret = drm_connector_init(drm, &fl->connector, &fl2000_connector_funcs,
-				 DRM_MODE_CONNECTOR_HDMIA);
+				 fl->ite_present ? DRM_MODE_CONNECTOR_HDMIA :
+						   DRM_MODE_CONNECTOR_VGA);
 	if (ret)
 		return ret;
 	drm_connector_helper_add(&fl->connector,
