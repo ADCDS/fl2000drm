@@ -199,6 +199,44 @@ bit-banged sequence.
 640x480@60 RGB565 color bars streamed from Python/pyusb over a USB 2.0
 link: 60.0 fps sustained, IT66121 reports VIDEO_STABLE during streaming.
 
+## Reverse-engineered from reference sources (2026-07-11)
+
+Sources: FrescoLogic/FL2000 (official GPL) + klogg/fl2000_drm register map.
+
+- **0x8000 VGA status**: bit1 vga_error(RSC) bit2 lbuf_halt bit3 iso_ack(RSC)
+  bit4 td_drop(RSC) bit5 irq_pending(RSC) bit6 pll_status bit7 dac_status
+  bit8 lbuf_overflow bit9 lbuf_underflow **bits[25:10] frame_cnt (16-bit
+  hardware frame counter)** bit26 hdmi_event(RSC) bit30 monitor_event(RSC)
+  bit31 edid_event(RSC). Sticky lbuf bits clear by writing them back.
+- **Interrupt EP**: EP3 IN, interface 2, 1 byte, bInterval 6 (4 ms). Fires
+  on VGA status events (hotplug, frame drop, lbuf errors); handler reads
+  0x8000. Official driver reacts to monitor/EDID events + logs frame drops.
+- **0x8004 is the pxclk control reg** (not just format): bit0
+  clear_watermark (what we pulse as "CCS reset"), bit1 frame_sync
+  (UNUSED by all known drivers — candidate for the EOF/vsync race fix),
+  bits2/3 h/v sync polarity, bit6 vga565, bit7 dac_output_en, bit8
+  vga_timing_en, bit9 use_new_pkt_retry, bit12 clear_lbuf_status, bit22
+  compress, bit24 palette, bit27 disable_halt, bit28 force_de_en, bit29
+  vga555.
+- **PLL 0x802C**: divisor[7:0] prescaler[9:8] function[14:13]
+  multiplier[23:16]; pclk = 10 MHz / prescaler × multiplier / divisor;
+  VCO = 10/presc×mult must be 62.5–1000 MHz; function = VCO band
+  (<125:0 <250:1 <500:2 else 3). Verified against all 11 table entries.
+  → arbitrary modes are synthesizable; the official big table itself goes
+  to 1920x1440@60 (234 MHz) and 1920x1200@85 (281 MHz).
+- **Sync regs**: 0x8008/0x8010 = active<<16|total; 0x800C = hsync_w<<16 |
+  (htotal−hsync_start+1); 0x8014 = start_latency<<20 | vsync_w<<16 |
+  (vtotal−vsync_start+1), start_latency conventionally = vstart, bit31 =
+  buf_error_en. Encoder validated bit-exact against the CEA 1080p60 row.
+- **EOF types**: official EOF_PENDING_BIT=0 / EOF_ZERO_LENGTH=1; bulk path
+  uses ZLP. Pending-bit tested on hardware over bulk: chip NAKs everything
+  — do not use.
+- **Frame pacing**: neither the official Linux driver (app-paced ioctl
+  renders) nor klogg (free-run) paces to vsync — the ZLP/vsync race is
+  unsolved everywhere, not a regression of ours.
+- 2560x1080@60.13 (LG DTD timings, PLL 186.0 MHz) added to our mode table
+  as first beyond-official-table synthesis — validation pending.
+
 ## Open questions / TODO
 
 - Compression details for USB2 at higher modes (fl2000_compression.c)
