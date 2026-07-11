@@ -202,6 +202,18 @@ static const struct fl2000_mode fl2000_modes[] = {
 	{ 1680, 1050, 60, 0x69008C0, 0x0B001C9, 0x41A0441, 0x2560025, 0x00756204,  0, 0x6, 0x1E },
 	{ 1920, 1080, 60, 0x7800898, 0x02C00C1, 0x4380465, 0x2A5002A, 0x00596106, 16, 0x5, 0x24 },
 	{ 1600, 1200, 60, 0x6400870, 0x0C001F1, 0x4B004E2, 0x3230032, 0x00616106,  0, 0x3, 0x2E },
+	/*
+	 * 2560x1080@60, synthesized from an LG ULTRAWIDE's native DTD
+	 * (185.58 MHz, 2784x1111 totals) — not from the reference big
+	 * table. PLL = 10 MHz x 93 / 5 = 186.0 MHz (+0.23%, 60.13 Hz).
+	 * Register encodings validated by re-encoding the CEA 1080p60
+	 * row bit-exactly; PLL model from the reference (VCO 62.5M-1G,
+	 * prescaler/multiplier/divisor, function = VCO band). The chip
+	 * scans faster clocks in the official table (1920x1440@60 =
+	 * 234 MHz), and at RGB565 this line width needs fewer bytes per
+	 * line than the official 1920@24bpp modes.
+	 */
+	{ 2560, 1080, 60, 0xA000AE0, 0x04000A1, 0x4380457, 0x1DA001D, 0x005D6105,  0, 0xA, 0x12 },
 };
 
 const struct fl2000_mode *fl2000_hw_find_mode(int width, int height,
@@ -219,9 +231,9 @@ const struct fl2000_mode *fl2000_hw_find_mode(int width, int height,
 	return NULL;
 }
 
-/* fl2000_monitor_set_resolution(), bulk pipe, EOF = zero-length packet */
+/* fl2000_monitor_set_resolution(), bulk pipe, EOF = ZLP or pending bit */
 int fl2000_hw_set_mode(struct fl2000 *fl, const struct fl2000_mode *mode,
-		       u32 wire_bpp)
+		       u32 wire_bpp, bool eof_pending)
 {
 	u32 h2 = mode->h_sync_2, v2 = mode->v_sync_2;
 	u32 val;
@@ -261,7 +273,7 @@ int fl2000_hw_set_mode(struct fl2000 *fl, const struct fl2000_mode *mode,
 	 * BEFORE the color format bits are set, never together with them.
 	 */
 
-	/* 0x803C: no BIA, no isoch interrupts/recovery, EOF type = ZLP */
+	/* 0x803C: no BIA, no isoch interrupts/recovery, EOF type */
 	{
 		static const u8 clear_803c[] = { 22, 24, 19, 21, 13, 27, 28, 29 };
 		int i;
@@ -272,14 +284,21 @@ int fl2000_hw_set_mode(struct fl2000 *fl, const struct fl2000_mode *mode,
 			if (ret)
 				goto out;
 		}
-		ret = fl2000_reg_update_locked(fl, 0x803C, 0, BIT(28));
+		ret = fl2000_reg_update_locked(fl, 0x803C, 0,
+					       BIT(eof_pending ? 29 : 28));
 		if (ret)
 			goto out;
 	}
 
-	/* 0x8004: clean format config, pulse CCS reset, then select format */
+	/*
+	 * 0x8004: clean format config, pulse the watermark clear, then
+	 * select format. Bit 1 (frame_sync) survives the app reset, so
+	 * clear it here too — with it set, scanout slaves to USB frame
+	 * delivery and the refresh wobbles with host jitter (ITE loses
+	 * video-stable); tested and rejected as a blink fix.
+	 */
 	{
-		static const u8 clear_8004[] = { 28, 6, 31, 24, 25, 26, 27 };
+		static const u8 clear_8004[] = { 28, 6, 31, 24, 25, 26, 27, 1 };
 		int i;
 
 		for (i = 0; i < ARRAY_SIZE(clear_8004); i++) {

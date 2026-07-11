@@ -46,6 +46,37 @@ static int fmt;
 module_param(fmt, int, 0644);
 MODULE_PARM_DESC(fmt, "wire format: 0=auto 1=RGB565 2=RGB888 3=BGR888 4=XRGB32");
 
+/*
+ * EOF signaling experiment (takes effect on next display enable). ZLP mode
+ * exhibits a frame-boundary race in the chip: sporadically one frame is
+ * swallowed fast and the next is latched late (paired 10.6/22.7 ms ZLP
+ * intervals on the wire, summing to exactly two scanout periods) which
+ * scans out as a black blink. Pending-bit mode (0x803C bit 29 instead of
+ * bit 28) is the reference driver's alternative EOF type; with it the
+ * frame's final short packet marks EOF and no ZLP is sent.
+ */
+static int eof;
+module_param(eof, int, 0644);
+MODULE_PARM_DESC(eof, "frame EOF mode: 0=zero-length packet 1=pending bit (experimental)");
+
+/*
+ * Extra bits OR'd into VGA control 0x8004 after mode set, for frame-race
+ * experiments (reference register map): bit1 frame_sync, bit9
+ * use_new_pkt_retry, bit27 disable_halt. Takes effect on display enable.
+ */
+static unsigned int xbits4;
+module_param(xbits4, uint, 0644);
+MODULE_PARM_DESC(xbits4, "extra 0x8004 control bits (experimental, e.g. 0x2 = frame_sync)");
+
+/* VGA status register 0x8000 decode (reference register map) */
+#define FL2000_STATUS_VGA_ERROR		BIT(1)
+#define FL2000_STATUS_LBUF_HALT		BIT(2)
+#define FL2000_STATUS_TD_DROP		BIT(4)
+#define FL2000_STATUS_LBUF_OVERFLOW	BIT(8)
+#define FL2000_STATUS_LBUF_UNDERFLOW	BIT(9)
+#define FL2000_STATUS_FRAME_CNT(v)	(((v) >> 10) & 0xFFFF)
+#define FL2000_STATUS_EVENT_MASK	(BIT(26) | BIT(30) | BIT(31))
+
 /* rough payload budget per link speed, bytes/second */
 #define FL2000_BUDGET_USB2	 38000000ULL
 #define FL2000_BUDGET_USB3	400000000ULL
@@ -164,7 +195,14 @@ static void fl2000_stream_work(struct work_struct *work)
 				break;
 			off += len;
 		}
-		if (!ret)	/* zero-length packet = end of frame */
+		/*
+		 * ZLP EOF mode always needs the explicit marker; pending-bit
+		 * mode takes the frame's final short packet as EOF, so only
+		 * send a ZLP if the frame length is an exact chunk multiple
+		 * (then the ZLP itself is that short packet).
+		 */
+		if (!ret && (!fl->eof_pending ||
+			     fl->frame_len % FL2000_CHUNK_SIZE == 0))
 			ret = fl2000_submit_chunk(fl, NULL, 0);
 		if (!ret)	/* async errors surface via completions */
 			ret = atomic_xchg(&fl->stream_error, 0);
@@ -195,12 +233,24 @@ static void fl2000_stream_work(struct work_struct *work)
 		if (++frames == 300) {
 			u64 win_ms = div_u64(ktime_get_ns() - t_win, 1000000);
 			u8 ite_st = 0xFF;
+			u32 st = 0, hwf;
 
 			if (fl->ite_present)
 				fl2000_ite_status(fl, &ite_st);
+			fl2000_reg_read(fl, 0x8000, &st);
+			hwf = FL2000_STATUS_FRAME_CNT(st);
 			drm_info(&fl->drm,
-				 "stream: 300 frames in %llu ms (frame %u..%u us), ite=0x%02X\n",
-				 win_ms, min_us, max_us, ite_st);
+				 "stream: 300 frames in %llu ms (frame %u..%u us), ite=0x%02X hwfrm=+%u st=0x%08X%s%s%s intr=%d\n",
+				 win_ms, min_us, max_us, ite_st,
+				 (hwf - fl->last_frame_cnt) & 0xFFFF, st,
+				 st & FL2000_STATUS_LBUF_UNDERFLOW ? " UNDER" : "",
+				 st & FL2000_STATUS_LBUF_OVERFLOW ? " OVER" : "",
+				 st & FL2000_STATUS_LBUF_HALT ? " HALT" : "",
+				 atomic_read(&fl->intr_count));
+			fl->last_frame_cnt = hwf;
+			if (st & (FL2000_STATUS_LBUF_OVERFLOW |
+				  FL2000_STATUS_LBUF_UNDERFLOW))
+				fl2000_reg_write(fl, 0x8000, st);
 			frames = 0;
 			min_us = U32_MAX;
 			max_us = 0;
@@ -283,6 +333,113 @@ static void fl2000_status_work(struct work_struct *work)
 		drm_kms_helper_hotplug_event(&fl->drm);
 out:
 	drm_dev_exit(idx);
+}
+
+/*
+ * Interrupt EP: EP3 IN on interface 2 (1-byte payload, 4 ms service
+ * interval). The chip raises it for VGA status events — monitor/EDID
+ * hotplug, frame drops, line-buffer overflow/underflow. On each event we
+ * read reg 0x8000 (clears the self-clearing bits), log it, and write the
+ * sticky lbuf bits back to clear them. Reverse-engineering aid for the
+ * frame-boundary blink; hotplug events also feed the status worker.
+ */
+static struct usb_driver fl2000_usb_driver;
+
+static void fl2000_intr_complete(struct urb *urb)
+{
+	struct fl2000 *fl = urb->context;
+
+	if (urb->status)
+		return;		/* poisoned or device gone: stop quietly */
+	atomic_inc(&fl->intr_count);
+	queue_work(system_unbound_wq, &fl->intr_work);
+}
+
+static void fl2000_intr_work(struct work_struct *work)
+{
+	struct fl2000 *fl = container_of(work, struct fl2000, intr_work);
+	u32 st = 0;
+	int idx;
+
+	if (!drm_dev_enter(&fl->drm, &idx))
+		return;
+
+	if (!fl2000_reg_read(fl, 0x8000, &st)) {
+		dev_info_ratelimited(&fl->intf->dev,
+			"intr #%d st=0x%08X frame=%u%s%s%s%s%s\n",
+			atomic_read(&fl->intr_count), st,
+			FL2000_STATUS_FRAME_CNT(st),
+			st & FL2000_STATUS_LBUF_UNDERFLOW ? " LBUF-UNDER" : "",
+			st & FL2000_STATUS_LBUF_OVERFLOW ? " LBUF-OVER" : "",
+			st & FL2000_STATUS_LBUF_HALT ? " LBUF-HALT" : "",
+			st & FL2000_STATUS_TD_DROP ? " TD-DROP" : "",
+			st & FL2000_STATUS_VGA_ERROR ? " VGA-ERR" : "");
+		if (st & (FL2000_STATUS_LBUF_OVERFLOW |
+			  FL2000_STATUS_LBUF_UNDERFLOW))
+			fl2000_reg_write(fl, 0x8000, st);
+		if (st & FL2000_STATUS_EVENT_MASK)
+			queue_work(system_unbound_wq, &fl->status_work);
+	}
+
+	usb_submit_urb(fl->intr_urb, GFP_KERNEL);
+	drm_dev_exit(idx);
+}
+
+static void fl2000_intr_start(struct fl2000 *fl)
+{
+	struct usb_interface *intf = usb_ifnum_to_if(fl->udev, 2);
+	struct usb_endpoint_descriptor *desc;
+
+	if (!intf || usb_find_int_in_endpoint(intf->cur_altsetting, &desc))
+		return;
+	if (usb_driver_claim_interface(&fl2000_usb_driver, intf, fl))
+		return;
+
+	fl->intr_urb = usb_alloc_urb(0, GFP_KERNEL);
+	fl->intr_buf = usb_alloc_coherent(fl->udev, 8, GFP_KERNEL,
+					  &fl->intr_dma);
+	if (!fl->intr_urb || !fl->intr_buf)
+		goto err_free;
+
+	usb_fill_int_urb(fl->intr_urb, fl->udev,
+			 usb_rcvintpipe(fl->udev, usb_endpoint_num(desc)),
+			 fl->intr_buf, usb_endpoint_maxp(desc),
+			 fl2000_intr_complete, fl, desc->bInterval);
+	fl->intr_urb->transfer_dma = fl->intr_dma;
+	fl->intr_urb->transfer_flags |= URB_NO_TRANSFER_DMA_MAP;
+
+	if (usb_submit_urb(fl->intr_urb, GFP_KERNEL))
+		goto err_free;
+
+	fl->intr_intf = intf;
+	dev_info(&fl->intf->dev, "interrupt EP armed (ep %u, interval %d)\n",
+		 usb_endpoint_num(desc), desc->bInterval);
+	return;
+
+err_free:
+	usb_free_coherent(fl->udev, 8, fl->intr_buf, fl->intr_dma);
+	usb_free_urb(fl->intr_urb);
+	fl->intr_urb = NULL;
+	fl->intr_buf = NULL;
+	usb_set_intfdata(intf, NULL);
+	usb_driver_release_interface(&fl2000_usb_driver, intf);
+}
+
+static void fl2000_intr_stop(struct fl2000 *fl)
+{
+	struct usb_interface *intf = fl->intr_intf;
+
+	if (!intf)
+		return;
+	fl->intr_intf = NULL;
+	usb_poison_urb(fl->intr_urb);
+	cancel_work_sync(&fl->intr_work);
+	usb_set_intfdata(intf, NULL);
+	usb_driver_release_interface(&fl2000_usb_driver, intf);
+	usb_free_coherent(fl->udev, 8, fl->intr_buf, fl->intr_dma);
+	usb_free_urb(fl->intr_urb);
+	fl->intr_urb = NULL;
+	fl->intr_buf = NULL;
 }
 
 /*
@@ -374,10 +531,11 @@ static void fl2000_pipe_enable(struct drm_simple_display_pipe *pipe,
 	}
 	fl->mode = m;
 
+	fl->eof_pending = eof == 1;
 	ret = fl2000_hw_stream_prep(fl);
 	if (ret)
 		goto err_free;
-	ret = fl2000_hw_set_mode(fl, m, fl->wire_bpp);
+	ret = fl2000_hw_set_mode(fl, m, fl->wire_bpp, fl->eof_pending);
 	if (ret) {
 		drm_err(&fl->drm, "mode set failed: %d\n", ret);
 		goto err_free;
@@ -388,15 +546,24 @@ static void fl2000_pipe_enable(struct drm_simple_display_pipe *pipe,
 			drm_warn(&fl->drm, "IT66121 setup failed: %d\n", ret);
 	}
 
+	if (xbits4) {
+		u32 v = 0;
+
+		if (!fl2000_reg_read(fl, 0x8004, &v))
+			fl2000_reg_write(fl, 0x8004, v | xbits4);
+		drm_info(&fl->drm, "xbits4 experiment: OR'd 0x%08X into 0x8004\n",
+			 xbits4);
+	}
+
 	{
 		u32 r8004 = 0, r803c = 0;
 
 		fl2000_reg_read(fl, 0x8004, &r8004);
 		fl2000_reg_read(fl, 0x803C, &r803c);
 		drm_info(&fl->drm,
-			 "streaming %ux%u@%u, %u bytes/px (fmt=%d), 0x8004=0x%08X 0x803C=0x%08X\n",
+			 "streaming %ux%u@%u, %u bytes/px (fmt=%d eof=%s), 0x8004=0x%08X 0x803C=0x%08X\n",
 			 m->width, m->height, m->refresh, fl->wire_bpp, fmt,
-			 r8004, r803c);
+			 fl->eof_pending ? "pending" : "zlp", r8004, r803c);
 	}
 
 	WRITE_ONCE(fl->streaming, true);
@@ -657,7 +824,7 @@ static const struct drm_driver fl2000_drm_driver = {
 	.desc = "Fresco Logic FL2000 USB display",
 	.date = "20260711",
 	.major = 1,
-	.minor = 4,
+	.minor = 12,
 };
 
 static const struct drm_mode_config_funcs fl2000_mode_config_funcs = {
@@ -692,6 +859,7 @@ static int fl2000_probe(struct usb_interface *intf,
 	spin_lock_init(&fl->frame_swap_lock);
 	INIT_WORK(&fl->stream_work, fl2000_stream_work);
 	INIT_WORK(&fl->status_work, fl2000_status_work);
+	INIT_WORK(&fl->intr_work, fl2000_intr_work);
 
 	fl->stream_wq = alloc_workqueue("fl2000-stream",
 					WQ_HIGHPRI | WQ_UNBOUND, 1);
@@ -760,11 +928,13 @@ static int fl2000_probe(struct usb_interface *intf,
 		}
 	}
 
+	fl2000_intr_start(fl);
+
 	ret = drmm_mode_config_init(drm);
 	if (ret)
 		return ret;
 	drm->mode_config.min_width = 640;
-	drm->mode_config.max_width = 1920;
+	drm->mode_config.max_width = 2560;
 	drm->mode_config.min_height = 350;
 	drm->mode_config.max_height = 1200;
 	drm->mode_config.funcs = &fl2000_mode_config_funcs;
@@ -813,8 +983,14 @@ static int fl2000_probe(struct usb_interface *intf,
 static void fl2000_disconnect(struct usb_interface *intf)
 {
 	struct fl2000 *fl = usb_get_intfdata(intf);
-	struct drm_device *drm = &fl->drm;
+	struct drm_device *drm;
 
+	/* the claimed interrupt interface tears down with the main one */
+	if (!fl || intf != fl->intf)
+		return;
+	drm = &fl->drm;
+
+	fl2000_intr_stop(fl);
 	drm_kms_helper_poll_fini(drm);
 	drm_dev_unplug(drm);
 	cancel_work_sync(&fl->status_work);

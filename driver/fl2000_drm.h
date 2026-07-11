@@ -60,6 +60,7 @@ struct fl2000 {
 	size_t frame_len;
 	const struct fl2000_mode *mode;
 	u32 wire_bpp;			/* 2 = RGB565, 3 = RGB888 */
+	bool eof_pending;		/* EOF = pending bit, not ZLP */
 	bool streaming;
 	struct work_struct stream_work;
 
@@ -78,6 +79,19 @@ struct fl2000 {
 	unsigned int xfer_ring;
 	atomic_t stream_error;
 	struct workqueue_struct *stream_wq;
+
+	/*
+	 * Interrupt EP (EP3 IN on interface 2): the chip signals VGA
+	 * status events (monitor/EDID hotplug, frame drops, line-buffer
+	 * overflow/underflow) via reg 0x8000. RE instrumentation.
+	 */
+	struct usb_interface *intr_intf;
+	struct urb *intr_urb;
+	u8 *intr_buf;
+	dma_addr_t intr_dma;
+	struct work_struct intr_work;
+	atomic_t intr_count;
+	u32 last_frame_cnt;
 
 	/*
 	 * Async connector status: userspace connector ioctls only ever read
@@ -108,7 +122,7 @@ int fl2000_i2c_write32(struct fl2000 *fl, u8 addr, u8 offset, u32 val);
 int fl2000_hw_reset(struct fl2000 *fl);
 int fl2000_hw_dongle_init(struct fl2000 *fl);
 int fl2000_hw_set_mode(struct fl2000 *fl, const struct fl2000_mode *mode,
-		       u32 wire_bpp);
+		       u32 wire_bpp, bool eof_pending);
 int fl2000_hw_stream_prep(struct fl2000 *fl);
 const struct fl2000_mode *fl2000_hw_find_mode(int width, int height,
 					      int refresh);
