@@ -167,7 +167,9 @@ int fl2000_hw_reset(struct fl2000 *fl)
  * bit 28 always reads back 0, see the I2C quirk above). Without these,
  * VGA-only dongles (no IT66121) never drive their internal DAC and the
  * monitor sees no sync — found and validated on hardware by @ftoledo
- * (issue #1). The reference driver sets them unconditionally.
+ * (issue #1). Only for VGA dongles: on an IT66121 dongle these bits
+ * corrupted the 0x8004 format latch (phantom readback bits) and the
+ * bulk pipe stalled NAK-forever at 1920x1080 (-ETIMEDOUT).
  */
 int fl2000_hw_dongle_init(struct fl2000 *fl)
 {

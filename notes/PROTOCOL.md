@@ -54,13 +54,17 @@ HDMI transmitter chip on HDMI dongles. Transactions move 4 bytes at a time.
 | 30    | detect enable  | set at dongle init (see below)           |
 | 31    | OpStatus       | 1 = done. Write 0 to start next op.      |
 
-**Dongle init (after app reset): set bits 28 and 30.** The reference
-driver sets both unconditionally during card initialize (monitor-detect /
+**Dongle init (after app reset): set bits 28 and 30 — VGA dongles ONLY.**
+The reference driver sets both during card initialize (monitor-detect /
 EDID-detect machinery; exact field names unconfirmed). On VGA-only
 dongles (no IT66121) the internal VGA DAC never outputs sync without
 them — black screen, and the bulk pipe eventually stalls (-ETIMEDOUT)
 because scanout never starts consuming. Found and validated on hardware
 by @ftoledo (issue #1, stable 1440x900 on a VGA-only dongle).
+Do NOT set them on IT66121 dongles: observed on hardware to corrupt the
+0x8004 format latch (readback grows phantom bits, e.g. 0xC000C44C where
+a healthy run reads 0x00000000) and the bulk pipe never consumes at
+1920x1080 → NAK-forever, -ETIMEDOUT after ~50 retry frames.
 
 `0x8024` — read data (4 bytes, LE; byte at `offset+0` = bits 7:0).
 `0x8028` — write data (4 bytes, LE).

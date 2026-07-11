@@ -37,6 +37,8 @@ struct fl2000 {
 
 	struct usb_device *udev;
 	struct usb_interface *intf;
+	/* DMA-capable device (the host controller) for PRIME imports */
+	struct device *dmadev;
 	bool usb3;
 	bool ite_present;
 
