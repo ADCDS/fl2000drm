@@ -47,26 +47,21 @@ module_param(fmt, int, 0644);
 MODULE_PARM_DESC(fmt, "wire format: 0=auto 1=RGB565 2=RGB888 3=BGR888 4=XRGB32");
 
 /*
- * EOF signaling experiment (takes effect on next display enable). ZLP mode
- * exhibits a frame-boundary race in the chip: sporadically one frame is
- * swallowed fast and the next is latched late (paired 10.6/22.7 ms ZLP
- * intervals on the wire, summing to exactly two scanout periods) which
- * scans out as a black blink. Pending-bit mode (0x803C bit 29 instead of
- * bit 28) is the reference driver's alternative EOF type; with it the
- * frame's final short packet marks EOF and no ZLP is sent.
+ * Frame pacing (the anti-blink fix). Delivered flat-out (NAK-locked at
+ * FIFO full), the chip races its EOF latch against vsync and every few
+ * seconds fast-drains one frame while scanning out black (paired
+ * 10.6/22.7 ms frame times on the wire; ~20 blinks/min at 1080p).
+ * Instead, a frequency-locked loop paces one frame per scanout period -
+ * the period measured from the chip's own frame counter, since the PLL
+ * formula is off by a mode-dependent 0.1-0.6% - and a small proportional
+ * term on pre-submission ring backlog holds the delivery phase off the
+ * racy full mark. Measured: 4x fewer blinks at 1080p, race signature
+ * gone from the wire; the residual blinks are line-buffer underflows
+ * (a separate, bandwidth-margin mechanism).
  */
-static int eof;
-module_param(eof, int, 0644);
-MODULE_PARM_DESC(eof, "frame EOF mode: 0=zero-length packet 1=pending bit (experimental)");
-
-/*
- * Extra bits OR'd into VGA control 0x8004 after mode set, for frame-race
- * experiments (reference register map): bit1 frame_sync, bit9
- * use_new_pkt_retry, bit27 disable_halt. Takes effect on display enable.
- */
-static unsigned int xbits4;
-module_param(xbits4, uint, 0644);
-MODULE_PARM_DESC(xbits4, "extra 0x8004 control bits (experimental, e.g. 0x2 = frame_sync)");
+static int pace = 1;
+module_param(pace, int, 0644);
+MODULE_PARM_DESC(pace, "frame pacing: 0=off 1=frequency-locked to the chip's scanout (default)");
 
 /* VGA status register 0x8000 decode (reference register map) */
 #define FL2000_STATUS_VGA_ERROR		BIT(1)
@@ -130,6 +125,7 @@ static void fl2000_xfer_complete(struct urb *urb)
 
 	if (urb->status)
 		atomic_cmpxchg(&fl->stream_error, 0, urb->status);
+	atomic_dec(&fl->inflight);
 	up(&fl->xfer_sem);
 }
 
@@ -152,11 +148,13 @@ static int fl2000_submit_chunk(struct fl2000 *fl, const void *data,
 	/* buffers are pre-mapped: no per-submit IOMMU map/unmap traffic */
 	x->urb->transfer_dma = x->dma;
 	x->urb->transfer_flags |= URB_NO_TRANSFER_DMA_MAP;
+	atomic_inc(&fl->inflight);
 	ret = usb_submit_urb(x->urb, GFP_KERNEL);
 	if (ret) {
 		/* roll back so ring order stays aligned with completions */
 		fl->xfer_ring = (fl->xfer_ring + FL2000_NUM_XFERS - 1) %
 				FL2000_NUM_XFERS;
+		atomic_dec(&fl->inflight);
 		up(&fl->xfer_sem);
 	}
 	return ret;
@@ -179,6 +177,15 @@ static void fl2000_stream_work(struct work_struct *work)
 
 		t_frame = ktime_get_ns();
 
+		/*
+		 * Pacing phase detector: ring backlog measured BEFORE
+		 * submitting the next frame. (Sampling after submission is
+		 * meaningless — the ring is always near-full then, which
+		 * drove an earlier servo into a starve/catch-up limit cycle.)
+		 */
+		if (pace)
+			fl->pace_occ = atomic_read(&fl->inflight);
+
 		spin_lock(&fl->frame_swap_lock);
 		if (fl->frame_ready) {
 			swap(fl->send_buf, fl->ready_buf);
@@ -195,14 +202,7 @@ static void fl2000_stream_work(struct work_struct *work)
 				break;
 			off += len;
 		}
-		/*
-		 * ZLP EOF mode always needs the explicit marker; pending-bit
-		 * mode takes the frame's final short packet as EOF, so only
-		 * send a ZLP if the frame length is an exact chunk multiple
-		 * (then the ZLP itself is that short packet).
-		 */
-		if (!ret && (!fl->eof_pending ||
-			     fl->frame_len % FL2000_CHUNK_SIZE == 0))
+		if (!ret)	/* zero-length packet = end of frame */
 			ret = fl2000_submit_chunk(fl, NULL, 0);
 		if (!ret)	/* async errors surface via completions */
 			ret = atomic_xchg(&fl->stream_error, 0);
@@ -226,27 +226,84 @@ static void fl2000_stream_work(struct work_struct *work)
 			errors = 0;
 		}
 
-		/* pacing + link health telemetry, roughly every 5 s at 60 Hz */
 		frame_us = div_u64(ktime_get_ns() - t_frame, 1000);
+
+		if (pace && fl->frame_period_ns) {
+			/*
+			 * Frequency-locked pacing on an absolute deadline
+			 * chain. The period comes from measuring the chip's
+			 * own frame counter (the PLL formula is off by a
+			 * mode-dependent 0.1-0.6%, and integrator servos
+			 * wind up through the starve/catch-up asymmetry —
+			 * v2 and v3 both heartbeat-cycled). Only a small
+			 * proportional phase term on the pre-submission
+			 * backlog remains; overshoot self-corrects because
+			 * deadlines are absolute, and a stall resyncs the
+			 * chain to now.
+			 */
+			s64 err = (s64)fl->pace_occ - fl->pace_occ_target;
+			u64 now = ktime_get_ns();
+
+			if (!fl->next_frame_ns ||
+			    (s64)(now - fl->next_frame_ns) >
+			    2 * (s64)fl->frame_period_ns)
+				fl->next_frame_ns = now;
+			fl->next_frame_ns += fl->frame_period_ns + err * 500;
+			if (fl->next_frame_ns > now + 2000) {
+				u32 us = div_u64(fl->next_frame_ns - now,
+						 1000) - 1;
+
+				usleep_range(us, us + 50);
+			}
+		}
+
+		/* link health telemetry, roughly every 5 s at 60 Hz */
 		min_us = min(min_us, frame_us);
 		max_us = max(max_us, frame_us);
 		if (++frames == 300) {
-			u64 win_ms = div_u64(ktime_get_ns() - t_win, 1000000);
+			u64 win_ns = ktime_get_ns() - t_win;
+			u64 win_ms = div_u64(win_ns, 1000000);
 			u8 ite_st = 0xFF;
-			u32 st = 0, hwf;
+			u32 st = 0, hwf, hwd;
 
 			if (fl->ite_present)
 				fl2000_ite_status(fl, &ite_st);
 			fl2000_reg_read(fl, 0x8000, &st);
 			hwf = FL2000_STATUS_FRAME_CNT(st);
+			hwd = (hwf - fl->last_frame_cnt) & 0xFFFF;
 			drm_info(&fl->drm,
 				 "stream: 300 frames in %llu ms (frame %u..%u us), ite=0x%02X hwfrm=+%u st=0x%08X%s%s%s intr=%d\n",
-				 win_ms, min_us, max_us, ite_st,
-				 (hwf - fl->last_frame_cnt) & 0xFFFF, st,
+				 win_ms, min_us, max_us, ite_st, hwd, st,
 				 st & FL2000_STATUS_LBUF_UNDERFLOW ? " UNDER" : "",
 				 st & FL2000_STATUS_LBUF_OVERFLOW ? " OVER" : "",
 				 st & FL2000_STATUS_LBUF_HALT ? " HALT" : "",
 				 atomic_read(&fl->intr_count));
+			/*
+			 * FLL rate reference: the chip free-runs, so its
+			 * frame counter over the window is the true scanout
+			 * rate regardless of what we delivered. First valid
+			 * sample locks directly, then a 3:1 EMA; ±2% of the
+			 * PLL-formula value as sanity bounds.
+			 */
+			if (pace && hwd >= 250 && hwd <= 360) {
+				u64 meas = div_u64(win_ns, hwd);
+
+				if (meas > div_u64(fl->period_pll_ns * 98, 100) &&
+				    meas < div_u64(fl->period_pll_ns * 102, 100)) {
+					if (fl->frame_period_ns ==
+					    fl->period_pll_ns)
+						fl->frame_period_ns = meas;
+					else
+						fl->frame_period_ns =
+							(3 * fl->frame_period_ns +
+							 meas) / 4;
+				}
+			}
+			if (pace)
+				drm_info(&fl->drm,
+					 "pace: period=%lluns occ=%d/%u\n",
+					 fl->frame_period_ns, fl->pace_occ,
+					 fl->pace_occ_target);
 			fl->last_frame_cnt = hwf;
 			if (st & (FL2000_STATUS_LBUF_OVERFLOW |
 				  FL2000_STATUS_LBUF_UNDERFLOW))
@@ -520,6 +577,27 @@ static void fl2000_pipe_enable(struct drm_simple_display_pipe *pipe,
 	sema_init(&fl->xfer_sem, FL2000_NUM_XFERS);
 	fl->xfer_ring = 0;
 	atomic_set(&fl->stream_error, 0);
+	atomic_set(&fl->inflight, 0);
+	fl->next_frame_ns = 0;
+	fl->pace_occ = 0;
+	fl->pace_occ_target = clamp_t(u32,
+				      (fl->frame_len / FL2000_CHUNK_SIZE + 1) / 4,
+				      4, 24);
+	{
+		/* approximate scanout period from the PLL fields (the
+		 * reference clock is off by a mode-dependent fraction of a
+		 * percent; the FLL refines this from the hw frame counter)
+		 */
+		u32 mult = (m->pll >> 16) & 0xFF;
+		u32 presc = (m->pll >> 8) & 0x3;
+		u32 divisor = m->pll & 0xFF;
+		u64 pclk = div_u64(10000000ULL * mult, presc * divisor);
+
+		fl->period_pll_ns = div64_u64(
+			(u64)(m->h_sync_1 & 0xFFF) * (m->v_sync_1 & 0xFFF) *
+			1000000000ULL, pclk);
+		fl->frame_period_ns = fl->period_pll_ns;
+	}
 	for (int i = 0; i < FL2000_NUM_XFERS; i++) {
 		fl->xfers[i].urb = usb_alloc_urb(0, GFP_KERNEL);
 		fl->xfers[i].buf = usb_alloc_coherent(fl->udev,
@@ -531,11 +609,10 @@ static void fl2000_pipe_enable(struct drm_simple_display_pipe *pipe,
 	}
 	fl->mode = m;
 
-	fl->eof_pending = eof == 1;
 	ret = fl2000_hw_stream_prep(fl);
 	if (ret)
 		goto err_free;
-	ret = fl2000_hw_set_mode(fl, m, fl->wire_bpp, fl->eof_pending);
+	ret = fl2000_hw_set_mode(fl, m, fl->wire_bpp);
 	if (ret) {
 		drm_err(&fl->drm, "mode set failed: %d\n", ret);
 		goto err_free;
@@ -546,24 +623,15 @@ static void fl2000_pipe_enable(struct drm_simple_display_pipe *pipe,
 			drm_warn(&fl->drm, "IT66121 setup failed: %d\n", ret);
 	}
 
-	if (xbits4) {
-		u32 v = 0;
-
-		if (!fl2000_reg_read(fl, 0x8004, &v))
-			fl2000_reg_write(fl, 0x8004, v | xbits4);
-		drm_info(&fl->drm, "xbits4 experiment: OR'd 0x%08X into 0x8004\n",
-			 xbits4);
-	}
-
 	{
 		u32 r8004 = 0, r803c = 0;
 
 		fl2000_reg_read(fl, 0x8004, &r8004);
 		fl2000_reg_read(fl, 0x803C, &r803c);
 		drm_info(&fl->drm,
-			 "streaming %ux%u@%u, %u bytes/px (fmt=%d eof=%s), 0x8004=0x%08X 0x803C=0x%08X\n",
+			 "streaming %ux%u@%u, %u bytes/px (fmt=%d pace=%d period=%lluns), 0x8004=0x%08X 0x803C=0x%08X\n",
 			 m->width, m->height, m->refresh, fl->wire_bpp, fmt,
-			 fl->eof_pending ? "pending" : "zlp", r8004, r803c);
+			 pace, fl->frame_period_ns, r8004, r803c);
 	}
 
 	WRITE_ONCE(fl->streaming, true);
@@ -824,7 +892,7 @@ static const struct drm_driver fl2000_drm_driver = {
 	.desc = "Fresco Logic FL2000 USB display",
 	.date = "20260711",
 	.major = 1,
-	.minor = 12,
+	.minor = 13,
 };
 
 static const struct drm_mode_config_funcs fl2000_mode_config_funcs = {

@@ -231,9 +231,9 @@ const struct fl2000_mode *fl2000_hw_find_mode(int width, int height,
 	return NULL;
 }
 
-/* fl2000_monitor_set_resolution(), bulk pipe, EOF = ZLP or pending bit */
+/* fl2000_monitor_set_resolution(), bulk pipe, EOF = zero-length packet */
 int fl2000_hw_set_mode(struct fl2000 *fl, const struct fl2000_mode *mode,
-		       u32 wire_bpp, bool eof_pending)
+		       u32 wire_bpp)
 {
 	u32 h2 = mode->h_sync_2, v2 = mode->v_sync_2;
 	u32 val;
@@ -284,8 +284,12 @@ int fl2000_hw_set_mode(struct fl2000 *fl, const struct fl2000_mode *mode,
 			if (ret)
 				goto out;
 		}
-		ret = fl2000_reg_update_locked(fl, 0x803C, 0,
-					       BIT(eof_pending ? 29 : 28));
+		/*
+		 * Bit 28 = EOF by ZLP. The alternative pending-bit mode
+		 * (bit 29) was tested on hardware: the chip NAKs the whole
+		 * bulk stream — do not use.
+		 */
+		ret = fl2000_reg_update_locked(fl, 0x803C, 0, BIT(28));
 		if (ret)
 			goto out;
 	}

@@ -234,6 +234,38 @@ Sources: FrescoLogic/FL2000 (official GPL) + klogg/fl2000_drm register map.
 - **Frame pacing**: neither the official Linux driver (app-paced ioctl
   renders) nor klogg (free-run) paces to vsync — the ZLP/vsync race is
   unsolved everywhere, not a regression of ours.
+
+## Frame pacing (anti-blink), what works and what doesn't (2026-07-11)
+
+The EOF/vsync race only fires when delivery is NAK-locked (URB ring
+saturated). Fix that shipped: a frequency-locked loop — one frame per
+scanout period on an ABSOLUTE deadline chain, period measured from the
+hardware frame counter (reg 0x8000 bits[25:10]) each telemetry window,
+small P-term on pre-submission ring backlog. Measured on hardware:
+race signature eliminated from the wire, 1080p blinks ~20/min → ~5/min.
+Residual blinks (both modes) are line-buffer underflows — a separate
+bandwidth-margin mechanism; a reduced-blanking mode entry (lower pixel
+clock = lower line-drain rate) is the untested candidate.
+
+Hard-won constraints, in blood:
+- Relative per-frame sleeps accumulate usleep_range overshoot
+  (~0.7 ms/frame!) — absolute deadlines only.
+- The PLL-formula period is off by a mode-dependent 0.1–0.6% (chip's
+  10 MHz reference is not 10.000 MHz); never trust it as a pacing base,
+  measure via the hw frame counter (the chip free-runs, so its counter
+  is the true rate even while you under/over-deliver).
+- No integrators on ring occupancy: the starve→resync→catch-up path
+  reads high occupancy exactly when running slow and winds the integral
+  the wrong way (limit-cycle "heartbeat", ~1 s on / 1 s black).
+- Sample occupancy BEFORE frame submission, never after.
+- The URB ring must exceed the largest frame's URB count (2560x1080@16
+  = 86 URBs) or submission is semaphore-throttled to the wire and the
+  servo never engages (ring is 128 now).
+- frame_sync (0x8004 bit 1): slaves scanout to delivery — refresh
+  wobbles with host jitter, ITE drops video-stable. Rejected. The bit
+  survives app reset; mode-set must clear it.
+- lbuf watermark (0x8030, default 0x0001) has no effect on the race;
+  buf_error_en (0x8014 bit31) routes no interrupts. Both dead ends.
 - 2560x1080@60.13 (LG DTD timings, PLL 186.0 MHz) added to our mode table
   as first beyond-official-table synthesis — validation pending.
 

@@ -60,7 +60,12 @@ struct fl2000 {
 	size_t frame_len;
 	const struct fl2000_mode *mode;
 	u32 wire_bpp;			/* 2 = RGB565, 3 = RGB888 */
-	bool eof_pending;		/* EOF = pending bit, not ZLP */
+	u64 period_pll_ns;		/* PLL-formula period (approximate!) */
+	u64 frame_period_ns;		/* working period, FLL-measured */
+	atomic_t inflight;		/* URBs submitted, not yet completed */
+	u64 next_frame_ns;		/* pacing absolute deadline chain */
+	u32 pace_occ_target;		/* pre-submission backlog target */
+	int pace_occ;			/* last pre-submission backlog */
 	bool streaming;
 	struct work_struct stream_work;
 
@@ -70,11 +75,16 @@ struct fl2000 {
 	 * one pipe complete in submission order, so a counting semaphore
 	 * plus round-robin slot reuse is race-free.
 	 */
+	/*
+	 * Ring must exceed the largest frame's URB count (2560x1080@16bpp
+	 * = 86) or submission is semaphore-throttled to the wire and the
+	 * pacing servo can never hold surplus to own the delivery phase.
+	 */
 	struct fl2000_xfer {
 		struct urb *urb;
 		u8 *buf;	/* usb_alloc_coherent, pre-mapped for DMA */
 		dma_addr_t dma;
-	} xfers[64];
+	} xfers[128];
 	struct semaphore xfer_sem;
 	unsigned int xfer_ring;
 	atomic_t stream_error;
@@ -122,7 +132,7 @@ int fl2000_i2c_write32(struct fl2000 *fl, u8 addr, u8 offset, u32 val);
 int fl2000_hw_reset(struct fl2000 *fl);
 int fl2000_hw_dongle_init(struct fl2000 *fl);
 int fl2000_hw_set_mode(struct fl2000 *fl, const struct fl2000_mode *mode,
-		       u32 wire_bpp, bool eof_pending);
+		       u32 wire_bpp);
 int fl2000_hw_stream_prep(struct fl2000 *fl);
 const struct fl2000_mode *fl2000_hw_find_mode(int width, int height,
 					      int refresh);
