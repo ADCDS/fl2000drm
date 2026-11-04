@@ -10,6 +10,7 @@
 #include <linux/mutex.h>
 #include <linux/semaphore.h>
 #include <linux/usb.h>
+#include <linux/version.h>
 #include <linux/workqueue.h>
 
 #include <drm/drm_connector.h>
@@ -37,6 +38,10 @@ struct fl2000 {
 
 	struct usb_device *udev;
 	struct usb_interface *intf;
+#if LINUX_VERSION_CODE < KERNEL_VERSION(6, 17, 0)
+	/* DMA-capable device (the host controller) for PRIME imports */
+	struct device *dmadev;
+#endif
 	bool usb3;
 	bool ite_present;
 

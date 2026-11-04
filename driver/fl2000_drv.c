@@ -15,6 +15,7 @@
 #include <linux/module.h>
 #include <linux/usb.h>
 #include <linux/bitops.h>
+#include <linux/version.h>
 #include <linux/vmalloc.h>
 
 #include <drm/drm_atomic_helper.h>
@@ -33,11 +34,24 @@
 #include <drm/drm_modeset_helper_vtables.h>
 #include <drm/drm_probe_helper.h>
 #include <drm/drm_print.h>
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 14, 0)
 #include <drm/clients/drm_client_setup.h>
+#elif LINUX_VERSION_CODE >= KERNEL_VERSION(6, 13, 0)
+#include <drm/drm_client_setup.h>
+#endif
 
 #include "fl2000_drm.h"
 
 #define DRIVER_NAME	"fl2000drm"
+
+/* 6.17 dropped the swab argument (big-endian output got its own helper) */
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 17, 0)
+#define fl2000_fb_xrgb8888_to_rgb565(...) \
+	drm_fb_xrgb8888_to_rgb565(__VA_ARGS__)
+#else
+#define fl2000_fb_xrgb8888_to_rgb565(...) \
+	drm_fb_xrgb8888_to_rgb565(__VA_ARGS__, false)
+#endif
 
 /*
  * Wire format override for experiments, runtime-changeable; takes effect
@@ -631,7 +645,8 @@ static void fl2000_pipe_enable(struct drm_simple_display_pipe *pipe,
 
 	fl->wire_bpp = fl2000_wire_bpp_for(fl, m);
 	fl->frame_len = (size_t)m->width * m->height * fl->wire_bpp;
-	fl->read_buf = kmalloc_objs(u32, ALIGN(m->width + 3, 4));
+	fl->read_buf = kmalloc_array(ALIGN(m->width + 3, 4), sizeof(u32),
+				     GFP_KERNEL);
 	fl->convert_buf = vzalloc(fl->frame_len);
 	fl->write_buf = vzalloc(fl->frame_len);
 	fl->ready_buf = vzalloc(fl->frame_len);
@@ -789,9 +804,9 @@ static void fl2000_pipe_update(struct drm_simple_display_pipe *pipe,
 		iosys_map_memcpy_from(fl->read_buf + aligned_len, &src,
 				      aligned_len, read_len - aligned_len);
 		if (fl->wire_bpp == 2)
-			drm_fb_xrgb8888_to_rgb565(&dst, &dst_pitch, &read,
-						  &line_fb, &line,
-						  &shadow->fmtcnv_state);
+			fl2000_fb_xrgb8888_to_rgb565(&dst, &dst_pitch, &read,
+						     &line_fb, &line,
+						     &shadow->fmtcnv_state);
 		else if (fl->wire_bpp == 4)
 			drm_fb_memcpy(&dst, &dst_pitch, &read, &line_fb, &line);
 		else if (fmt == 3)
@@ -966,13 +981,42 @@ static const struct drm_connector_funcs fl2000_connector_funcs = {
 
 DEFINE_DRM_GEM_FOPS(fl2000_fops);
 
+#if LINUX_VERSION_CODE < KERNEL_VERSION(6, 17, 0)
+/*
+ * Before 6.17, DRM_GEM_SHMEM_DRIVER_OPS imports by mapping the sg_table,
+ * so PRIME imports (Xorg output slaving: i915 renders, we scan out) must
+ * be DMA-mapped against the USB host controller — the USB interface
+ * device itself has no dma_mask and the default import path WARNs and
+ * fails, which leaves the slaved output permanently black. From 6.17 the
+ * shmem ops import without mapping (CPU access only), which is all the
+ * frame update path needs.
+ */
+static struct drm_gem_object *
+fl2000_gem_prime_import(struct drm_device *drm, struct dma_buf *dma_buf)
+{
+	struct fl2000 *fl = to_fl2000(drm);
+
+	if (!fl->dmadev)
+		return ERR_PTR(-ENODEV);
+	return drm_gem_prime_import_dev(drm, dma_buf, fl->dmadev);
+}
+#endif
+
 static const struct drm_driver fl2000_drm_driver = {
 	.driver_features = DRIVER_MODESET | DRIVER_GEM | DRIVER_ATOMIC,
 	.fops = &fl2000_fops,
 	DRM_GEM_SHMEM_DRIVER_OPS,
+#if LINUX_VERSION_CODE < KERNEL_VERSION(6, 17, 0)
+	.gem_prime_import = fl2000_gem_prime_import,
+#endif
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 13, 0)
 	DRM_FBDEV_SHMEM_DRIVER_OPS,
+#endif
 	.name = DRIVER_NAME,
 	.desc = "Fresco Logic FL2000 USB display",
+#if LINUX_VERSION_CODE < KERNEL_VERSION(6, 14, 0)
+	.date = "20260711",
+#endif
 	.major = 1,
 	.minor = 13,
 };
@@ -1020,6 +1064,20 @@ static int fl2000_probe(struct usb_interface *intf,
 				       fl->stream_wq);
 	if (ret)
 		return ret;
+
+#if LINUX_VERSION_CODE < KERNEL_VERSION(6, 17, 0)
+	fl->dmadev = usb_intf_get_dma_device(intf);
+	if (fl->dmadev) {
+		ret = devm_add_action_or_reset(&intf->dev,
+					       (void (*)(void *))put_device,
+					       fl->dmadev);
+		if (ret)
+			return ret;
+	} else {
+		dev_warn(&intf->dev,
+			 "no DMA device, buffer sharing (PRIME) disabled\n");
+	}
+#endif
 
 	/* streaming bulk endpoint lives on interface 0 altsetting 1 */
 	ret = usb_set_interface(udev, 0, 1);
@@ -1108,7 +1166,11 @@ static int fl2000_probe(struct usb_interface *intf,
 		return ret;
 	}
 
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 13, 0)
 	drm_client_setup(drm, NULL);
+#else
+	drm_fbdev_shmem_setup(drm, 32);
+#endif
 
 	dev_info(&intf->dev,
 		 "FL2000DX on USB%c link%s, modes up to %s\n",
