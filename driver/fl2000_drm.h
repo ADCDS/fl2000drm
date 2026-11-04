@@ -62,6 +62,13 @@ struct fl2000 {
 	void *ready_buf;
 	void *send_buf;
 	bool frame_ready;
+	/*
+	 * Page-flip completion for the published frame, held until the
+	 * stream worker picks that frame up (both under frame_swap_lock).
+	 */
+	struct drm_pending_vblank_event *pending_event;
+	bool stream_alive;
+	wait_queue_head_t frame_wq;	/* commit published or flip held */
 	size_t frame_len;
 	const struct fl2000_mode *mode;
 	u32 wire_bpp;			/* 2 = RGB565, 3 = RGB888 */

@@ -33,6 +33,7 @@
 #include <drm/drm_modes.h>
 #include <drm/drm_modeset_helper_vtables.h>
 #include <drm/drm_probe_helper.h>
+#include <drm/drm_vblank.h>
 #include <drm/drm_print.h>
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 14, 0)
 #include <drm/clients/drm_client_setup.h>
@@ -79,6 +80,16 @@ MODULE_PARM_DESC(fmt, "wire format: 0=auto 1=RGB565 2=RGB888 3=BGR888 4=XRGB32")
 static int pace = 1;
 module_param(pace, int, 0644);
 MODULE_PARM_DESC(pace, "frame pacing: 0=off 1=frequency-locked to the chip's scanout (default)");
+
+/*
+ * Late latch: while a compositor is animating, the stream waits up to this
+ * long at a frame pickup for a commit that is about to land, instead of
+ * repeating the old frame and halving the compositor's rate. The USB
+ * backlog (tens of ms) absorbs the delay.
+ */
+static unsigned int latch_us = 6000;
+module_param(latch_us, uint, 0644);
+MODULE_PARM_DESC(latch_us, "max wait at frame pickup for an in-progress commit, us (0=off)");
 
 /* VGA status register 0x8000 decode (reference register map) */
 #define FL2000_STATUS_VGA_ERROR		BIT(1)
@@ -180,18 +191,84 @@ static int fl2000_submit_chunk(struct fl2000 *fl, const void *data,
 	return ret;
 }
 
+/*
+ * Flip-completion pacing. Without vblank support DRM completes each page
+ * flip the moment the commit returns, so compositors time their frames
+ * against nothing: on this output KWin fell to ~30 Hz under cursor motion
+ * or ran faster than the chip's ~60 Hz scanout, and frames were repeated
+ * or dropped (visible as cursor and scrolling judder). Instead, hold the
+ * commit's event until the stream worker picks up its frame — the closest
+ * thing this hardware has to a vblank — so userspace locks to the real
+ * rate.
+ *
+ * Events carry the scheduled pickup time, not the send time: a commit
+ * caught by the late latch must not push the compositor's next target
+ * later, or the lateness would compound frame after frame. Same fields
+ * drm_crtc_send_vblank_event() fills, minus its choice of timestamp.
+ */
+static void fl2000_send_event(struct fl2000 *fl,
+			      struct drm_pending_vblank_event *event,
+			      ktime_t stamp)
+{
+	struct timespec64 tv = ktime_to_timespec64(stamp);
+	unsigned long flags;
+
+	if (!event)
+		return;
+	event->pipe = drm_crtc_index(&fl->pipe.crtc);
+	event->event.vbl.sequence = 0;
+	event->event.vbl.tv_sec = tv.tv_sec;
+	event->event.vbl.tv_usec = tv.tv_nsec / 1000;
+	spin_lock_irqsave(&fl->drm.event_lock, flags);
+	drm_send_event_timestamp_locked(&fl->drm, &event->base, stamp);
+	spin_unlock_irqrestore(&fl->drm.event_lock, flags);
+}
+
+/* Returns an event the caller must send now, if any. */
+static struct drm_pending_vblank_event *
+fl2000_defer_event_locked(struct fl2000 *fl,
+			  struct drm_pending_vblank_event *event)
+{
+	struct drm_pending_vblank_event *old;
+
+	if (!fl->stream_alive)
+		return event;
+	/* normally empty: DRM waits for flip_done before the next commit */
+	old = fl->pending_event;
+	fl->pending_event = event;
+	return old;
+}
+
+/* The stream is not (or no longer) running: never leave a flip pending. */
+static void fl2000_stream_stopped(struct fl2000 *fl)
+{
+	struct drm_pending_vblank_event *event;
+
+	spin_lock(&fl->frame_swap_lock);
+	fl->stream_alive = false;
+	event = fl->pending_event;
+	fl->pending_event = NULL;
+	spin_unlock(&fl->frame_swap_lock);
+	fl2000_send_event(fl, event, ktime_get());
+}
+
 static void fl2000_stream_work(struct work_struct *work)
 {
 	struct fl2000 *fl = container_of(work, struct fl2000, stream_work);
 	u64 t_win = ktime_get_ns(), t_frame;
+	bool animating = false;	/* the previous pickup completed a flip */
 	u32 frames = 0, frame_us, min_us = U32_MAX, max_us = 0;
 	int errors = 0;
 	int idx;
 
-	if (!drm_dev_enter(&fl->drm, &idx))
+	if (!drm_dev_enter(&fl->drm, &idx)) {
+		fl2000_stream_stopped(fl);
 		return;
+	}
 
 	while (READ_ONCE(fl->streaming)) {
+		struct drm_pending_vblank_event *event;
+		ktime_t stamp;
 		size_t off = 0;
 		int ret = 0;
 
@@ -206,12 +283,29 @@ static void fl2000_stream_work(struct work_struct *work)
 		if (pace)
 			fl->pace_occ = atomic_read(&fl->inflight);
 
+		/* the pickup's nominal time: the pacing deadline when pacing */
+		stamp = pace && fl->next_frame_ns ?
+			ns_to_ktime(fl->next_frame_ns) : ktime_get();
+		if (animating && latch_us && !READ_ONCE(fl->frame_ready) &&
+		    !READ_ONCE(fl->pending_event))
+			wait_event_hrtimeout(fl->frame_wq,
+					     READ_ONCE(fl->frame_ready) ||
+					     READ_ONCE(fl->pending_event) ||
+					     !READ_ONCE(fl->streaming),
+					     ns_to_ktime((u64)latch_us *
+							 NSEC_PER_USEC));
+
 		spin_lock(&fl->frame_swap_lock);
 		if (fl->frame_ready) {
 			swap(fl->send_buf, fl->ready_buf);
 			fl->frame_ready = false;
 		}
+		event = fl->pending_event;
+		fl->pending_event = NULL;
 		spin_unlock(&fl->frame_swap_lock);
+		/* this frame goes out now: complete the flip that made it */
+		animating = !!event;
+		fl2000_send_event(fl, event, stamp);
 
 		while (off < fl->frame_len) {
 			size_t len = min_t(size_t, FL2000_CHUNK_SIZE,
@@ -336,6 +430,7 @@ static void fl2000_stream_work(struct work_struct *work)
 		cond_resched();
 	}
 
+	fl2000_stream_stopped(fl);
 	drm_dev_exit(idx);
 }
 
@@ -715,6 +810,9 @@ static void fl2000_pipe_enable(struct drm_simple_display_pipe *pipe,
 			 pace, fl->frame_period_ns, r8004, r803c);
 	}
 
+	spin_lock(&fl->frame_swap_lock);
+	fl->stream_alive = true;
+	spin_unlock(&fl->frame_swap_lock);
 	WRITE_ONCE(fl->streaming, true);
 	queue_work(fl->stream_wq, &fl->stream_work);
 	drm_dev_exit(idx);
@@ -732,6 +830,7 @@ static void fl2000_pipe_disable(struct drm_simple_display_pipe *pipe)
 
 	WRITE_ONCE(fl->streaming, false);
 	cancel_work_sync(&fl->stream_work);
+	fl2000_stream_stopped(fl);
 	fl2000_kill_xfers(fl);
 
 	if (drm_dev_enter(&fl->drm, &idx)) {
@@ -761,13 +860,23 @@ static void fl2000_pipe_update(struct drm_simple_display_pipe *pipe,
 	unsigned int dst_pitch;
 	size_t offset, read_len, aligned_len;
 	int idx, y;
+	/* ours from here on: completed at frame pickup, or right away */
+	struct drm_pending_vblank_event *event = pipe->crtc.state->event;
+
+	pipe->crtc.state->event = NULL;
 
 	if (!fb || !fl->write_buf || !fl->mode)
-		return;
-	if (!drm_atomic_helper_damage_merged(old_state, state, &damage))
-		return;
+		goto send_now;
+	if (!drm_atomic_helper_damage_merged(old_state, state, &damage)) {
+		/* nothing new to show: still complete at the next pickup */
+		spin_lock(&fl->frame_swap_lock);
+		event = fl2000_defer_event_locked(fl, event);
+		spin_unlock(&fl->frame_swap_lock);
+		wake_up(&fl->frame_wq);
+		goto send_now;
+	}
 	if (!drm_dev_enter(&fl->drm, &idx))
-		return;
+		goto send_now;
 
 	/*
 	 * Retain undamaged pixels in a commit-owned buffer: the rotating
@@ -841,9 +950,13 @@ static void fl2000_pipe_update(struct drm_simple_display_pipe *pipe,
 	spin_lock(&fl->frame_swap_lock);
 	swap(fl->write_buf, fl->ready_buf);
 	fl->frame_ready = true;
+	event = fl2000_defer_event_locked(fl, event);
 	spin_unlock(&fl->frame_swap_lock);
+	wake_up(&fl->frame_wq);
 
 	drm_dev_exit(idx);
+send_now:
+	fl2000_send_event(fl, event, ktime_get());
 }
 
 static const struct drm_simple_display_pipe_funcs fl2000_pipe_funcs = {
@@ -1051,6 +1164,7 @@ static int fl2000_probe(struct usb_interface *intf,
 	mutex_init(&fl->ite_lock);
 	mutex_init(&fl->edid_lock);
 	spin_lock_init(&fl->frame_swap_lock);
+	init_waitqueue_head(&fl->frame_wq);
 	INIT_WORK(&fl->stream_work, fl2000_stream_work);
 	INIT_WORK(&fl->status_work, fl2000_status_work);
 	INIT_WORK(&fl->intr_work, fl2000_intr_work);
